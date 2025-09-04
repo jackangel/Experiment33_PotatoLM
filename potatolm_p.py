@@ -172,7 +172,12 @@ class LanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx)
         x = tok_emb + self.rope(tok_emb)
         for block in self.blocks:
-            x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            # Only use checkpointing during training to save memory.
+            # During evaluation (chat), run the forward pass normally.
+            if self.training:
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -185,7 +190,7 @@ class LanguageModel(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=0.8, top_k=20):
-        self.eval()
+        # self.eval() is called in the chat() function before this is used
         for _ in range(max_new_tokens):
             idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
             seq_len = idx_cond.shape[1]
@@ -193,8 +198,11 @@ class LanguageModel(nn.Module):
             if pad_len != 0:
                 padding = torch.zeros((idx_cond.shape[0], pad_len), dtype=torch.long, device=device)
                 idx_cond = torch.cat([idx_cond, padding], dim=1)
-            with torch.amp.autocast(device_type=device):
-                logits, _ = self(idx_cond)
+            
+            # No need for autocast here as we are in no_grad mode, but it doesn't hurt
+            # with torch.amp.autocast(device_type=device):
+            logits, _ = self(idx_cond)
+
             logits = logits[:, seq_len - 1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -203,12 +211,12 @@ class LanguageModel(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
             yield idx_next
-        self.train()
 
 # --- Training Function ---
 def train():
     print(f"--- Starting Training (Chunked Hierarchical Version) ---")
     model = LanguageModel().to(device)
+    model.train() # Set model to training mode
     print(f"Device: {device}, Context: {block_size}, Chunk Size: {chunk_size}, Heads: {n_head}, Params: ~{sum(p.numel() for p in model.parameters())/1e6:.2f}M")
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -236,16 +244,65 @@ def train():
 
         if (iter_num + 1) % eval_interval == 0:
             print(f"\nIteration {iter_num+1}/{num_iterations} | Loss: {loss.item():.4f}")
+            model.eval() # Switch to eval mode for generation
             context = torch.zeros((1, 1), dtype=torch.long, device=device)
             for token_tensor in model.generate(idx=context, max_new_tokens=100):
                 char = decode(token_tensor[0].tolist())
                 print(char, end='', flush=True)
+            model.train() # Switch back to train mode
             print("\n-------------------------")
     
     if 'loss' in locals() and not torch.isnan(loss):
         print(f"Training complete. Saving checkpoint to {CHECKPOINT_PATH}")
         torch.save(model.state_dict(), CHECKPOINT_PATH)
 
+# --- Chat Function ---
+def chat():
+    print(f"Checkpoint found at '{CHECKPOINT_PATH}'. Entering chat mode.")
+    print("Type 'exit' or 'quit' to end the session.")
+    
+    # --- Model Setup ---
+    model = LanguageModel().to(device)
+    print("Loading model...")
+    try:
+        model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
+        model.eval() # Set the model to evaluation mode
+        print(f"Model loaded successfully. Params: ~{sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    except Exception as e:
+        print(f"Error loading model checkpoint: {e}")
+        return
+
+    # --- Interactive Loop ---
+    while True:
+        prompt = input("\n> ")
+        if prompt.lower() in ['exit', 'quit']:
+            break
+        if not prompt:
+            continue
+
+        context = torch.tensor(encode(prompt), dtype=torch.long, device=device).unsqueeze(0)
+        
+        print(prompt, end='', flush=True) # Print the initial prompt
+        
+        try:
+            # The generate function is a generator, so we iterate through it
+            for token_tensor in model.generate(idx=context, max_new_tokens=500, temperature=0.8, top_k=50):
+                char = decode(token_tensor[0].tolist())
+                print(char, end='', flush=True)
+        except KeyboardInterrupt:
+            # Allow user to stop generation with Ctrl+C
+            print("\nGeneration interrupted.")
+            continue
+        except Exception as e:
+            print(f"\nAn error occurred during generation: {e}")
+            continue
+            
+    print("\nExiting chat mode.")
+
 # --- Main Execution Logic ---
 if __name__ == '__main__':
-    train()
+    if os.path.exists(CHECKPOINT_PATH):
+        chat()
+    else:
+        print(f"Checkpoint '{CHECKPOINT_PATH}' not found. Starting training...")
+        train()
